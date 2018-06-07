@@ -3,6 +3,11 @@
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
 
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_thread.h>
+
+#include <unistd.h>
+
 #define ENABLE_LOGS 1
 
 #ifdef ENABLE_LOGS
@@ -201,6 +206,8 @@ int saveNumFramesToDisk(const char* url, int numFrames) {
         int i = 0;
         int frameFinished = 0;
         for(;;) { // av_read_frame() loop
+            av_packet_unref(&packet);
+			
             res = av_read_frame(pFormatContext, &packet);
             if (res < 0) {
                 LOG("av_read_frame() returned %s\n", av_err2str(res));
@@ -246,7 +253,7 @@ int saveNumFramesToDisk(const char* url, int numFrames) {
     } while (0);
 
     //
-    // cleanup
+    // Cleanup
     //
 
     if (buffer)
@@ -277,13 +284,280 @@ int saveNumFramesToDisk(const char* url, int numFrames) {
     return res;
 }
 
+int outputVideoFramesToWindow(const char* url) {
+    if (!url)
+        return -1;
+
+    int res = AVERROR_UNKNOWN;
+
+    AVFormatContext* pFormatContext = NULL;
+    AVCodecContext* pCodecContext = NULL;
+    AVFrame* pFrame = NULL;
+
+    SDL_Event event;
+    SDL_Window* hWindow = NULL;
+    SDL_Renderer* hRenderer = NULL;
+    SDL_Texture* hTexture = NULL;
+
+    uint8_t *yPlane = NULL, *uPlane = NULL, *vPlane = NULL;
+
+    do {
+        av_register_all();
+
+        res = SDL_Init(SDL_INIT_TIMER | SDL_INIT_AUDIO | SDL_INIT_VIDEO);
+        if (res < 0) {
+            LOG("SDL_Init() failed with %s\n", SDL_GetError());
+            break;
+        }
+
+        res = avformat_open_input(&pFormatContext, url, NULL, NULL);
+        if (res < 0) {
+            LOG("avformat_open_input() returned \"%s\"\n", av_err2str(res));
+            break;
+        }
+
+        res = avformat_find_stream_info(pFormatContext, NULL);
+        if (res < 0) {
+            LOG("avformat_find_stream_info() returned \"%s\"\n", av_err2str(res));
+            break;
+        }
+
+        av_dump_format(pFormatContext, 0, url, 0);
+
+        int videoStreamIndex = -1;
+        for (int i = 0; i < pFormatContext->nb_streams; ++i) {
+            if (AVMEDIA_TYPE_VIDEO == pFormatContext->streams[i]->codec->codec_type) {
+                videoStreamIndex = i;
+                break;
+            }
+        }
+        if (-1 == videoStreamIndex) {
+            LOG("Video stream was not found\n");
+            break;
+        }
+
+        AVCodecContext* pCodecContextOrig = pFormatContext->streams[videoStreamIndex]->codec;
+        AVCodec* pCodec = avcodec_find_decoder(pCodecContextOrig->codec_id);
+        if (!pCodec) {
+            LOG("Unable to find decoder %d\n", pCodecContextOrig->codec_id);
+            break;
+        }
+
+        // Copy codec context, because we cannot use AVCodecContext from video stream directly
+        pCodecContext = avcodec_alloc_context3(pCodec);
+        if (!pCodecContext) {
+            LOG("avcodec_alloc_context3() failed\n");
+            break;
+        }
+
+        res = avcodec_copy_context(pCodecContext, pCodecContextOrig);
+        if (res < 0) {
+            LOG("avcodec_copy_context() failed with %s\n", av_err2str(res));
+            break;
+        }
+
+        res = avcodec_open2(pCodecContext, pCodec, NULL);
+        if (res < 0) {
+            LOG("avcodec_open2() failed with %s\n", av_err2str(res));
+            break;
+        }
+
+        hWindow = SDL_CreateWindow("uPlayer",
+                                   SDL_WINDOWPOS_UNDEFINED,
+                                   SDL_WINDOWPOS_UNDEFINED,
+                                   pCodecContext->width,
+                                   pCodecContext->height,
+                                   0);
+        if (!hWindow) {
+            LOG("SDL_CreateWindow() failed with %s\n", SDL_GetError());
+            break;
+        }
+
+        hRenderer = SDL_CreateRenderer(hWindow, -1, 0);
+        if (!hRenderer) {
+            LOG("SDL_CreateRenderer() failed with %s\n", SDL_GetError());
+            break;
+        }
+
+        hTexture = SDL_CreateTexture(hRenderer,
+                                     SDL_PIXELFORMAT_YV12,
+                                     SDL_TEXTUREACCESS_STREAMING,
+                                     pCodecContext->width,
+                                     pCodecContext->height);
+        if (!hTexture) {
+            LOG("SDL_CreateTexture() failed with %s\n", SDL_GetError());
+            break;
+        }
+
+        // Initialize SWS context for software scaling
+        struct SwsContext* pSwsContext = sws_getContext(pCodecContext->width,
+                                                       pCodecContext->height,
+                                                       pCodecContext->pix_fmt,
+                                                       pCodecContext->width,
+                                                       pCodecContext->height,
+                                                       AV_PIX_FMT_YUV420P,
+                                                       SWS_BILINEAR,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL);
+        if (!pSwsContext) {
+            LOG("sws_getContext() failed\n");
+            break;
+        }
+
+        AVPacket packet;
+        memset(&packet, 0, sizeof(packet));
+
+        pFrame = av_frame_alloc();
+        if (!pFrame) {
+            LOG("av_frame_alloc() failed for YUV frame\n");
+            break;
+        }
+
+        // Set up YV12 pixel array (12 bits per array)
+        size_t yPlaneSize = pCodecContext->width * pCodecContext->height;
+        size_t uvPlaneSize = (pCodecContext->width * pCodecContext->height) / 4;
+        yPlane = av_malloc(yPlaneSize);
+        uPlane = av_malloc(uvPlaneSize);
+        vPlane = av_malloc(uvPlaneSize);
+        if (!yPlane || !uPlane || !vPlane) {
+            LOG("av_malloc() failed for pixel buffers\n");
+            break;
+        }
+
+        int stopped = 0;
+        int frameFinished = 0;
+        int uvPitch = pCodecContext->width / 2;
+        for(;;) { // av_read_frame() loop
+            av_packet_unref(&packet);
+
+            if (stopped) {
+                LOG("User stopped playback\n");
+                break;
+            }
+
+            res = av_read_frame(pFormatContext, &packet);
+            if (res < 0) {
+                LOG("av_read_frame() returned %s\n", av_err2str(res));
+                break;
+            }
+
+            if (videoStreamIndex == packet.stream_index) {
+                // Decode video frame and place it to pFrame
+                res = avcodec_decode_video2(pCodecContext, pFrame, &frameFinished, &packet);
+                if (res >= 0) {
+                    if (frameFinished) {
+                        AVPicture picture;
+                        picture.data[0] = yPlane;
+                        picture.data[1] = uPlane;
+                        picture.data[2] = vPlane;
+                        picture.linesize[0] = pCodecContext->width;
+                        picture.linesize[1] = uvPitch;
+                        picture.linesize[2] = uvPitch;
+
+                        // Convert the into YUV format that SDL uses
+                        res = sws_scale(pSwsContext,
+                                        (const uint8_t* const *)pFrame->data,
+                                        pFrame->linesize,
+                                        0,
+                                        pCodecContext->height,
+                                        picture.data,
+                                        picture.linesize);
+                        if (res > 0) {
+                            res = SDL_UpdateYUVTexture(hTexture,
+                                                       NULL,
+                                                       yPlane,
+                                                       pCodecContext->width,
+                                                       uPlane,
+                                                       uvPitch,
+                                                       vPlane,
+                                                       uvPitch);
+                            if (0 == res) {
+                                SDL_RenderClear(hRenderer);
+                                SDL_RenderCopy(hRenderer, hTexture, NULL, NULL);
+                                SDL_RenderPresent(hRenderer);
+                                usleep(30 * 1000);
+                            } // if (SDL_UpdateYUVTexture() == 0)
+                            else
+                                LOG("SDL_UpdateYUVTexture() failed with %d\n", res);
+
+                        } // if (sws_scale() > 0)
+                        else
+                            LOG("sws_scale() failed\n");
+
+                    } // if (frameFinished)
+
+                } // if (avcodec_decode_video2() >= 0)
+                else
+                    LOG("avcodec_decode_video2() failed with %s\n", av_err2str(res));
+
+            } // if (videoStreamIndex == packet.stream_index)
+
+            SDL_PollEvent(&event);
+            switch (event.type) {
+            case SDL_QUIT: {
+                SDL_DestroyTexture(hTexture);
+                SDL_DestroyRenderer(hRenderer);
+                SDL_DestroyWindow(hWindow);
+                SDL_Quit();
+                stopped = 1;
+                break;
+            }
+            default:
+                break;
+            }
+
+        } // for(;;) av_read_frame() loop
+
+        LOG("av_read_frame() loop finished\n");
+    } while (0);
+
+    //
+    // Cleanup
+    //
+    if (yPlane)
+        av_free(yPlane);
+
+    if (uPlane)
+        av_free(uPlane);
+
+    if (vPlane)
+        av_free(vPlane);
+
+    if (hTexture)
+        SDL_DestroyTexture(hTexture);
+
+    if (hRenderer)
+        SDL_DestroyRenderer(hRenderer);
+
+    if (hWindow)
+        SDL_DestroyWindow(hWindow);
+
+    if (pFrame)
+        av_frame_free(&pFrame);
+
+    if (pCodecContext)
+        avcodec_free_context(&pCodecContext);
+
+    if (pFormatContext) {
+        avformat_close_input(&pFormatContext);
+        LOG("avformat_close_input() returned.\n");
+    }
+
+    return res;
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         LOG("Usage:\n    uplayer file_name\n");
         return -1;
     }
 
-    int res = saveNumFramesToDisk(argv[1], 20);
+    int res = -1;
+
+    //res = saveNumFramesToDisk(argv[1], 20);
+
+    res = outputVideoFramesToWindow(argv[1]);
 
     return res;
 }

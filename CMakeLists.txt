@@ -13,4 +13,4 @@ set(CMAKE_C_FLAGS -Wno-deprecated-declarations)
 
 include_directories(${sourcesDir}/include/)
 add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
-target_link_libraries(${PROJECT_NAME} avformat avcodec swscale)
+target_link_libraries(${PROJECT_NAME} avformat avcodec swscale SDL2)

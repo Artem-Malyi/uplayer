@@ -2,6 +2,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
+#include <libavfilter/avfilter.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
@@ -331,12 +332,26 @@ int outputVideoFramesToWindow(const char* url) {
                 break;
             }
         }
+
         if (-1 == videoStreamIndex) {
             LOG("Video stream was not found\n");
             break;
         }
 
         AVCodecContext* pCodecContextOrig = pFormatContext->streams[videoStreamIndex]->codec;
+        int width = pCodecContextOrig->width;
+        int height = pCodecContextOrig->height;
+        int rotateAngle = 0;
+
+        AVDictionaryEntry* rotateTag = av_dict_get(pFormatContext->streams[videoStreamIndex]->metadata, "rotate", NULL, 0);
+        if (rotateTag) {
+            rotateAngle = atoi(rotateTag->value);
+            if (rotateAngle == 90 || rotateAngle == 270) {
+                width = pCodecContextOrig->height;
+                height = pCodecContextOrig->width;
+            }
+        }
+
         AVCodec* pCodec = avcodec_find_decoder(pCodecContextOrig->codec_id);
         if (!pCodec) {
             LOG("Unable to find decoder %d\n", pCodecContextOrig->codec_id);
@@ -477,6 +492,7 @@ int outputVideoFramesToWindow(const char* url) {
                                 SDL_RenderCopy(hRenderer, hTexture, NULL, NULL);
                                 SDL_RenderPresent(hRenderer);
                                 usleep(30 * 1000);
+                                //SDL_WaitEventTimeout(&event, 30);
                             } // if (SDL_UpdateYUVTexture() == 0)
                             else
                                 LOG("SDL_UpdateYUVTexture() failed with %d\n", res);

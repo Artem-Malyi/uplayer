@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
@@ -566,7 +565,6 @@ int outputVideoFramesToWindow(const char* url) {
 typedef struct _PacketQueue {
     AVPacketList *first, *last;
     int packetsNumber;
-    int packetsSize;
     SDL_mutex* mutex;
     SDL_cond* condition;
 } PacketQueue;
@@ -602,7 +600,6 @@ int packetQueuePut(PacketQueue* pQ, AVPacket* packet) {
     pQ->last = pTmp;
 
     pQ->packetsNumber++;
-    pQ->packetsSize += pTmp->pkt.size;
 
     SDL_CondSignal(pQ->condition);
 
@@ -629,7 +626,6 @@ int packetQueueGet(PacketQueue* pQ, AVPacket* packet, int block) {
             if (!pQ->first)
                 pQ->last = NULL;
             pQ->packetsNumber--;
-            pQ->packetsSize -= pTmp->pkt.size;
             *packet = pTmp->pkt;
             av_free(pTmp);
             res = 1;

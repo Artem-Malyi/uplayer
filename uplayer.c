@@ -18,12 +18,15 @@
 static const int SDL_AUDIO_BUFFER_SIZE = 1024;
 static const int MAX_AUDIO_FRAME_SIZE = 192000;
 static const int VIDEO_PICTURE_QUEUE_SIZE = 2000;
+static const int MAX_AUDIOQ_SIZE = 5 * 16 * 1024;
+static const int MAX_VIDEOQ_SIZE = 5 * 256 * 1024;
 
 static int gQuitFlag = 0;
 
 typedef struct _PacketQueue {
     AVPacketList *first, *last;
     int packetsNumber;
+    int size;
     SDL_mutex* mutex;
     SDL_cond* condition;
 } PacketQueue;
@@ -605,6 +608,7 @@ int packetQueuePut(PacketQueue* pQ, AVPacket* packet) {
     pQ->last = pTmp;
 
     pQ->packetsNumber++;
+    pQ->size += pTmp->pkt.size;
 
     SDL_CondSignal(pQ->condition);
 
@@ -629,6 +633,7 @@ int packetQueueGet(PacketQueue* pQ, AVPacket* packet, int block) {
             if (!pQ->first)
                 pQ->last = NULL;
             pQ->packetsNumber--;
+            pQ->size -= pTmp->pkt.size;
             *packet = pTmp->pkt;
             av_free(pTmp);
             res = 1;
@@ -1323,6 +1328,85 @@ int videoThread(void* data) {
     if (!pPlayer)
         return -1;
 
+    int res = AVERROR_UNKNOWN;
+    uint8_t *yPlane = NULL, *uPlane = NULL, *vPlane = NULL;
+    AVPacket packet, *pPacket = &packet;
+
+    // Set up YV12 pixel array (12 bits per array)
+    size_t yPlaneSize = pPlayer->pVideoCodecContext->width * pPlayer->pVideoCodecContext->height;
+    size_t uvPlaneSize = (pPlayer->pVideoCodecContext->width * pPlayer->pVideoCodecContext->height) / 4;
+    yPlane = av_malloc(yPlaneSize);
+    uPlane = av_malloc(uvPlaneSize);
+    vPlane = av_malloc(uvPlaneSize);
+    if (!yPlane || !uPlane || !vPlane) {
+        LOG("av_malloc() failed for pixel buffers\n");
+        return -1;
+    }
+
+    int frameFinished = 0;
+    int uvPitch = pPlayer->pVideoCodecContext->width / 2;
+
+    AVFrame* pFrame = av_frame_alloc();
+
+    for (;;) {
+        if (packetQueueGet(&pPlayer->videoQ, pPacket, 1) < 0) {
+            LOG("Quit getting packets\n");
+            break;
+        }
+
+        // Decode video frame and place it to pFrame
+        res = avcodec_decode_video2(pPlayer->pVideoCodecContext, pFrame, &frameFinished, pPacket);
+        if (res >= 0) {
+            if (frameFinished) {
+                AVPicture picture;
+                picture.data[0] = yPlane;
+                picture.data[1] = uPlane;
+                picture.data[2] = vPlane;
+                picture.linesize[0] = pPlayer->pVideoCodecContext->width;
+                picture.linesize[1] = uvPitch;
+                picture.linesize[2] = uvPitch;
+
+                // Convert the into YUV format that SDL uses
+                res = sws_scale(pPlayer->pSwsContext,
+                                (const uint8_t* const *)pFrame->data,
+                                pFrame->linesize,
+                                0,
+                                pPlayer->pVideoCodecContext->height,
+                                picture.data,
+                                picture.linesize);
+                if (res > 0) {
+                    res = SDL_UpdateYUVTexture(pPlayer->hTexture,
+                                               NULL,
+                                               yPlane,
+                                               pPlayer->pVideoCodecContext->width,
+                                               uPlane,
+                                               uvPitch,
+                                               vPlane,
+                                               uvPitch);
+                    if (0 == res) {
+                        SDL_RenderClear(pPlayer->hRenderer);
+                        SDL_RenderCopy(pPlayer->hRenderer, pPlayer->hTexture, NULL, NULL);
+                        SDL_RenderPresent(pPlayer->hRenderer);
+                        SDL_Delay(35);
+                    } // if (SDL_UpdateYUVTexture() == 0)
+                    else
+                        LOG("SDL_UpdateYUVTexture() failed with %d\n", res);
+
+                } // if (sws_scale() > 0)
+                else
+                    LOG("sws_scale() failed\n");
+
+            } // if (frameFinished)
+
+        } // if (avcodec_decode_video2() >= 0)
+        else
+            LOG("avcodec_decode_video2() failed with %s\n", av_err2str(res));
+
+        av_packet_unref(pPacket);
+    }
+
+    av_frame_free(&pFrame);
+
     return 0;
 }
 
@@ -1403,11 +1487,12 @@ int startVideoThread(uPlayer* pPlayer) {
 
     pPlayer->hRenderer = hRenderer;
     pPlayer->hTexture = hTexture;
+    pPlayer->pSwsContext = pSwsContext;
 
     return 0;
 }
 
-int decodeThread(void* data) {
+int demuxThread(void* data) {
     uPlayer* pPlayer = data;
     if (!pPlayer)
         return -1;
@@ -1415,6 +1500,7 @@ int decodeThread(void* data) {
     int res = AVERROR_UNKNOWN;
 
     AVFormatContext* pFormatContext = NULL;
+    AVPacket packet, *pPacket = &packet;
 
     do {
         av_register_all();
@@ -1465,14 +1551,44 @@ int decodeThread(void* data) {
             break;
         }
 
-        // main decode loop
-        for (int i = 0; i < 10000; ++i) {
+        // demux loop
+        int i = -1;
+        for (;;) {
             if (pPlayer->quitNow)
                 break;
 
-            LOG("Main decode loop: %d\n", i);
+            LOG("Demux loop - frame: %d, audioQ.size: %d, videoQ.size: %d\n", ++i, pPlayer->audioQ.size, pPlayer->videoQ.size);
 
-            SDL_Delay(5);
+            // seek stuff goes here
+            if (pPlayer->audioQ.size > MAX_AUDIOQ_SIZE ||
+                pPlayer->videoQ.size > MAX_VIDEOQ_SIZE)
+            {
+                LOG("Queues are full, waiting\n");
+                SDL_Delay(10);
+                continue;
+            }
+
+            if (av_read_frame(pPlayer->pFormatContext, pPacket) < 0) {
+                if (pPlayer->pFormatContext->pb->error)
+                    break;
+
+                LOG("Wait for packets from TS stream\n");
+                SDL_Delay(100);
+                continue;
+            }
+
+            // Is this a packet from the video stream?
+            if (pPacket->stream_index == pPlayer->videoStreamIndex)
+                packetQueuePut(&pPlayer->videoQ, pPacket);
+            else if (pPacket->stream_index == pPlayer->audioStreamIndex)
+                packetQueuePut(&pPlayer->audioQ, pPacket);
+            else
+                av_free_packet(pPacket);
+        } // for (;;)
+
+        while (!pPlayer->quitNow) {
+            LOG("Demuxing packets is done. Waiting for exit\n");
+            SDL_Delay(100);
         }
 
     } while (0);
@@ -1524,9 +1640,9 @@ int playMovieWithoutLipSync(const char* url) {
             break;
         }
 
-        pPlayer->parseThreadId = SDL_CreateThread(decodeThread, "uPlayer-Decode-Thread", pPlayer);
+        pPlayer->parseThreadId = SDL_CreateThread(demuxThread, "uPlayer-Demux-Thread", pPlayer);
         if (!pPlayer->parseThreadId) {
-            LOG("SDL_CreateThread(\"uPlayer-Decode-Thread\") failed\n");
+            LOG("SDL_CreateThread(\"uPlayer-Demux-Thread\") failed\n");
             break;
         }
 

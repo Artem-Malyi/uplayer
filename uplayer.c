@@ -1147,7 +1147,7 @@ int audioDecodeFrame2(uPlayer* pPlayer, uint8_t* audioBuffer, int bufferSize) {
                                                       pPlayer->pAudioCodecContext->sample_fmt,
                                                       1);
                 if (dataSize <= bufferSize)
-                    memcpy(pPlayer->audioBuffer, pPlayer->audioFrame.data[0], dataSize);
+                    memcpy(audioBuffer, pPlayer->audioFrame.data[0], dataSize);
             }
 
             if (dataSize <= 0) {
@@ -1354,6 +1354,7 @@ int videoThread(void* data) {
             break;
         }
 
+        // TODO: refactor this code
         // Decode video frame and place it to pFrame
         res = avcodec_decode_video2(pPlayer->pVideoCodecContext, pFrame, &frameFinished, pPacket);
         if (res >= 0) {
@@ -1536,14 +1537,13 @@ int demuxThread(void* data) {
                 LOG("streamOpen(video) returned %s\n", av_err2str(res));
         }
 
-//        // TODO:
-//        if (audioStreamIndex >= 0) {
-//            res = streamOpen(pPlayer, audioStreamIndex);
-//            if (!res)
-//                startAudioThread(pPlayer);
-//            else
-//                LOG("streamOpen(audio) returned %s\n", av_err2str(res));
-//        }
+        if (audioStreamIndex >= 0) {
+            res = streamOpen(pPlayer, audioStreamIndex);
+            if (!res)
+                startAudioThread(pPlayer);
+            else
+                LOG("streamOpen(audio) returned %s\n", av_err2str(res));
+        }
 
         if (pPlayer->videoStreamIndex < 0 && pPlayer->audioStreamIndex < 0) {
             LOG("Could not open codecs for %s\n", pPlayer->url);
@@ -1557,13 +1557,11 @@ int demuxThread(void* data) {
             if (pPlayer->quitNow)
                 break;
 
-            LOG("Demux loop - frame: %d, audioQ.size: %d, videoQ.size: %d\n", ++i, pPlayer->audioQ.size, pPlayer->videoQ.size);
-
             // seek stuff goes here
-            if (pPlayer->audioQ.size > MAX_AUDIOQ_SIZE ||
+            if (pPlayer->audioQ.size > MAX_AUDIOQ_SIZE &&
                 pPlayer->videoQ.size > MAX_VIDEOQ_SIZE)
             {
-                LOG("Queues are full, waiting\n");
+                LOG("Both audio and video queues are full, waiting...\n");
                 SDL_Delay(10);
                 continue;
             }
@@ -1572,12 +1570,13 @@ int demuxThread(void* data) {
                 if (pPlayer->pFormatContext->pb->error)
                     break;
 
-                LOG("Wait for packets from TS stream\n");
+                LOG("Waiting for packets from stream...\n");
                 SDL_Delay(100);
                 continue;
             }
 
-            // Is this a packet from the video stream?
+            LOG("Demux loop - iteration: %d, audioQ.size: %d, videoQ.size: %d\n", ++i, pPlayer->audioQ.size, pPlayer->videoQ.size);
+
             if (pPacket->stream_index == pPlayer->videoStreamIndex)
                 packetQueuePut(&pPlayer->videoQ, pPacket);
             else if (pPacket->stream_index == pPlayer->audioStreamIndex)
@@ -1654,6 +1653,7 @@ int playMovieWithoutLipSync(const char* url) {
                 break;
             case UPLAYER_QUIT_EVENT:
             case SDL_QUIT:
+                gQuitFlag = 1; // TODO: get rid of it!
                 pPlayer->quitNow = 1;
                 SDL_Quit();
                 playerLoopQuitFlag = 1;

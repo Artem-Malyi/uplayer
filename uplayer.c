@@ -3,6 +3,7 @@
 #include <libswscale/swscale.h>
 #include <libavfilter/avfilter.h>
 #include <libavutil/avstring.h>
+#include <libswresample/swresample.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
@@ -15,7 +16,7 @@
     #define LOG(...) 
 #endif // ENABLE_LOGS
 
-static const int SDL_AUDIO_BUFFER_SIZE = 1024;
+static const int SDL_AUDIO_BUFFER_SIZE = 4096;
 static const int MAX_AUDIO_FRAME_SIZE = 192000;
 static const int VIDEO_PICTURE_QUEUE_SIZE = 2000;
 static const int MAX_AUDIOQ_SIZE = 5 * 16 * 1024;
@@ -652,7 +653,42 @@ int packetQueueGet(PacketQueue* pQ, AVPacket* packet, int block) {
     return res;
 }
 
-int audioDecodeFrame(AVCodecContext* pCodecContext, uint8_t* audioBuffer, int bufferSize, PacketQueue* pQ) {
+#define IN
+#define OUT
+
+int resample_audio(IN AVCodecContext* pCodecContext, IN AVFrame* pAudioFrame, IN int16_t* outBuffer, OUT int* dataSize) {
+    int res = -1;
+    if (!pCodecContext || ! pAudioFrame || !outBuffer || !dataSize)
+        return res;
+
+//    SwrContext *swr;
+
+//    ...
+
+//    // Set up SWR context once you've got codec information
+//    swr = swr_alloc();
+//    av_opt_set_int(swr, "in_channel_layout",  audioCodec->channel_layout, 0);
+//    av_opt_set_int(swr, "out_channel_layout", audioCodec->channel_layout,  0);
+//    av_opt_set_int(swr, "in_sample_rate",     audioCodec->sample_rate, 0);
+//    av_opt_set_int(swr, "out_sample_rate",    audioCodec->sample_rate, 0);
+//    av_opt_set_sample_fmt(swr, "in_sample_fmt",  AV_SAMPLE_FMT_FLTP, 0);
+//    av_opt_set_sample_fmt(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16,  0);
+//    swr_init(swr);
+
+//    res = swr_convert(&outBuffer, pAudioFrame.nb_samples, pAudioFrame.extended_data, pAudioFrame.nb_samples);
+//    if (res < 0)
+//        return res;
+
+//    *dataSize = av_samples_get_buffer_size(NULL,
+//                                           pCodecContext->channels,
+//                                           frame.nb_samples,
+//                                           AV_SAMPLE_FMT_S16,
+//                                           1);
+
+    return res;
+}
+
+int audioDecodeFrame(IN AVCodecContext* pCodecContext, IN uint8_t* audioBuffer, IN int bufferSize, IN PacketQueue* pQ) {
     int res = -1;
     if (!pCodecContext || !audioBuffer || !bufferSize || !pQ)
         return res;
@@ -677,11 +713,18 @@ int audioDecodeFrame(AVCodecContext* pCodecContext, uint8_t* audioBuffer, int bu
             int dataSize = 0;
 
             if (gotFrame) {
-                dataSize = av_samples_get_buffer_size(NULL,
-                                                      pCodecContext->channels,
-                                                      frame.nb_samples,
-                                                      pCodecContext->sample_fmt,
-                                                      1);
+                if (AV_SAMPLE_FMT_FLTP == pCodecContext->sample_fmt) {
+                    static int16_t outputBuffer[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+                    res = resample_audio(pCodecContext, &frame, outputBuffer, &dataSize);
+                    LOG("resample_audio() returned %d, ignore this error\n", res);
+                }
+                else {
+                    dataSize = av_samples_get_buffer_size(NULL,
+                                                          pCodecContext->channels,
+                                                          frame.nb_samples,
+                                                          pCodecContext->sample_fmt,
+                                                          1);
+                }
                 if (dataSize <= bufferSize)
                     memcpy(audioBuffer, frame.data[0], dataSize);
             }
@@ -837,7 +880,17 @@ int outputVideoAndAudio(const char* url) {
 
             SDL_AudioSpec wantedSpec, spec;
             wantedSpec.freq = pAudioCodecContext->sample_rate;
-            wantedSpec.format = AUDIO_F32SYS;
+            switch (pAudioCodecContext->sample_fmt) {
+            default:                 wantedSpec.format = AUDIO_F32SYS; break;
+            case AV_SAMPLE_FMT_U8:   wantedSpec.format = AUDIO_S8;     break;
+            case AV_SAMPLE_FMT_S16:  wantedSpec.format = AUDIO_S16SYS; break;
+            case AV_SAMPLE_FMT_S32:  wantedSpec.format = AUDIO_S32SYS; break;
+            case AV_SAMPLE_FMT_FLT:
+            case AV_SAMPLE_FMT_DBL:
+            case AV_SAMPLE_FMT_FLTP: wantedSpec.format = AUDIO_F32SYS; break;
+            }
+
+            //wantedSpec.format = AUDIO_F32SYS;
             wantedSpec.channels = pAudioCodecContext->channels;
             wantedSpec.silence = 0;
             wantedSpec.samples = SDL_AUDIO_BUFFER_SIZE;
@@ -1685,9 +1738,9 @@ int main(int argc, char* argv[]) {
 
     //res = outputVideoFramesToWindow(argv[1]);
 
-    //res = outputVideoAndAudio(argv[1]);
+    res = outputVideoAndAudio(argv[1]);
 
-    res = playMovieWithoutLipSync(argv[1]);
+    //res = playMovieWithoutLipSync(argv[1]);
 
     return res;
 }
